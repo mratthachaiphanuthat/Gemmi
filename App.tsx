@@ -1,123 +1,165 @@
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import Matter from 'matter-js';
+import * as THREE from 'three';
+import * as CANNON from 'cannon-es';
 import { SetupType, NarratorComment } from './types';
-import { createRagdoll, createEnvironment } from './services/physicsEngine';
+import { RagdollSystem, createEnvironment3D } from './services/physicsEngine';
 import { getNarratorComment } from './services/geminiService';
 
 const App: React.FC = () => {
   const [setup, setSetup] = useState<SetupType>(SetupType.PLAYGROUND);
-  const [comment, setComment] = useState<NarratorComment>({ text: "Welcome to the Lab. Try not to break him too much.", mood: 'snarky' });
+  const [comment, setComment] = useState<NarratorComment>({ text: "3D conversion complete. Let the kinetic experiments begin.", mood: 'snarky' });
   const [isLoadingComment, setIsLoadingComment] = useState(false);
   
-  const sceneRef = useRef<HTMLDivElement>(null);
-  const engineRef = useRef<Matter.Engine | null>(null);
-  const runnerRef = useRef<Matter.Runner | null>(null);
-  const renderRef = useRef<Matter.Render | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const worldRef = useRef<CANNON.World | null>(null);
+  const ragdollRef = useRef<RagdollSystem | null>(null);
+  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const sceneRef = useRef<THREE.Scene | null>(null);
+  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
+  const dragPlaneRef = useRef<THREE.Mesh | null>(null);
+  const mouseConstraintRef = useRef<CANNON.PointToPointConstraint | null>(null);
+  const dragBodyRef = useRef<CANNON.Body | null>(null);
   const lastActionTime = useRef<number>(0);
 
   const triggerAIComment = useCallback(async (action: string) => {
     const now = Date.now();
-    if (now - lastActionTime.current < 5000) return; // Rate limit AI comments
+    if (now - lastActionTime.current < 6000) return;
     lastActionTime.current = now;
-
     setIsLoadingComment(true);
     const newComment = await getNarratorComment(action, setup);
     setComment(newComment);
     setIsLoadingComment(false);
   }, [setup]);
 
-  const initPhysics = useCallback(() => {
-    if (!sceneRef.current) return;
-
-    // Cleanup previous instance
-    if (engineRef.current) {
-      Matter.Engine.clear(engineRef.current);
-      Matter.Render.stop(renderRef.current!);
-      Matter.Runner.stop(runnerRef.current!);
-      renderRef.current!.canvas.remove();
-      renderRef.current!.textures = {};
-    }
-
-    const engine = Matter.Engine.create();
-    const world = engine.world;
-    const width = window.innerWidth;
-    const height = window.innerHeight;
-
-    const render = Matter.Render.create({
-      element: sceneRef.current,
-      engine: engine,
-      options: {
-        width: width,
-        height: height,
-        wireframes: false,
-        background: 'transparent'
-      }
-    });
-
-    const runner = Matter.Runner.create();
-    
-    // Create setup
-    const envData = createEnvironment(world, setup, width, height);
-
-    // Create Ragdoll
-    const ragdoll = createRagdoll(width / 2, 100);
-    Matter.Composite.add(world, ragdoll);
-
-    // Mouse control
-    const mouse = Matter.Mouse.create(render.canvas);
-    const mouseConstraint = Matter.MouseConstraint.create(engine, {
-      mouse: mouse,
-      constraint: {
-        stiffness: 0.2,
-        render: { visible: false }
-      }
-    });
-
-    Matter.Composite.add(world, mouseConstraint);
-
-    // Special behavior for "The Grinder"
-    if (setup === SetupType.THE_GRINDER && envData.gears) {
-      Matter.Events.on(engine, 'beforeUpdate', () => {
-        envData.gears.forEach((gear: Matter.Body, i: number) => {
-          Matter.Body.setAngle(gear, gear.angle + (i === 0 ? 0.05 : -0.05));
-        });
-      });
-    }
-
-    // Capture dragging events for AI commentary
-    Matter.Events.on(mouseConstraint, 'startdrag', () => {
-      triggerAIComment("The player is dragging a limb aggressively.");
-    });
-
-    Matter.Render.run(render);
-    Matter.Runner.run(runner, engine);
-
-    engineRef.current = engine;
-    runnerRef.current = runner;
-    renderRef.current = render;
-
-    // Adjust gravity for certain levels
-    if (setup === SetupType.GRAVITY_WELL) {
-        engine.gravity.y = -0.5;
-    } else {
-        engine.gravity.y = 1;
-    }
-
-  }, [setup, triggerAIComment]);
-
   useEffect(() => {
-    initPhysics();
-    
-    const handleResize = () => {
-      initPhysics();
+    if (!containerRef.current) return;
+
+    // 1. Setup Three.js
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x020617);
+    sceneRef.current = scene;
+
+    const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 3, 6);
+    camera.lookAt(0, 1, 0);
+    cameraRef.current = camera;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    containerRef.current.appendChild(renderer.domElement);
+    rendererRef.current = renderer;
+
+    const ambientLight = new THREE.AmbientLight(0xffffff, 0.5);
+    scene.add(ambientLight);
+    const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+    directionalLight.position.set(5, 10, 5);
+    directionalLight.castShadow = true;
+    scene.add(directionalLight);
+
+    // 2. Setup Cannon Physics
+    const world = new CANNON.World();
+    world.gravity.set(0, -9.82, 0);
+    worldRef.current = world;
+
+    // 3. Setup Dragging Helpers
+    const dragPlane = new THREE.Mesh(new THREE.PlaneGeometry(100, 100), new THREE.MeshBasicMaterial({ visible: false }));
+    scene.add(dragPlane);
+    dragPlaneRef.current = dragPlane;
+
+    const raycaster = new THREE.Raycaster();
+    const mousePos = new THREE.Vector2();
+    let isDragging = false;
+
+    const handleMouseDown = (e: MouseEvent) => {
+      mousePos.x = (e.clientX / window.innerWidth) * 2 - 1;
+      mousePos.y = -(e.clientY / window.innerHeight) * 2 + 1;
+      raycaster.setFromCamera(mousePos, camera);
+      
+      const intersects = raycaster.intersectObjects(ragdollRef.current?.parts.map(p => p.mesh) || []);
+      if (intersects.length > 0) {
+        isDragging = true;
+        const targetMesh = intersects[0].object as THREE.Mesh;
+        const part = ragdollRef.current?.parts.find(p => p.mesh === targetMesh);
+        if (part) {
+          dragBodyRef.current = part.body;
+          const hitPoint = intersects[0].point;
+          
+          // Align drag plane to camera
+          dragPlane.position.copy(hitPoint);
+          dragPlane.lookAt(camera.position);
+
+          const localPivot = part.body.pointToLocalFrame(new CANNON.Vec3(hitPoint.x, hitPoint.y, hitPoint.z));
+          const emptyBody = new CANNON.Body({ mass: 0 });
+          mouseConstraintRef.current = new CANNON.PointToPointConstraint(part.body, localPivot, emptyBody, new CANNON.Vec3(hitPoint.x, hitPoint.y, hitPoint.z));
+          world.addConstraint(mouseConstraintRef.current);
+          
+          triggerAIComment("The player is handling the test subject's 3D anatomy.");
+        }
+      }
     };
 
-    window.addEventListener('resize', handleResize);
-    return () => {
-      window.removeEventListener('resize', handleResize);
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isDragging || !mouseConstraintRef.current) return;
+      mousePos.x = (e.clientX / window.innerWidth) * 2 - 1;
+      mousePos.y = -(e.clientY / window.innerHeight) * 2 + 1;
+      raycaster.setFromCamera(mousePos, camera);
+      const intersects = raycaster.intersectObject(dragPlane);
+      if (intersects.length > 0) {
+        const p = intersects[0].point;
+        mouseConstraintRef.current.pivotB.copy(new CANNON.Vec3(p.x, p.y, p.z));
+      }
     };
-  }, [initPhysics]);
+
+    const handleMouseUp = () => {
+      if (mouseConstraintRef.current) {
+        world.removeConstraint(mouseConstraintRef.current);
+        mouseConstraintRef.current = null;
+      }
+      isDragging = false;
+      dragBodyRef.current = null;
+    };
+
+    window.addEventListener('mousedown', handleMouseDown);
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+
+    // 4. Initial Env & Ragdoll
+    const ragdoll = new RagdollSystem(world, scene, 0, 3, 0);
+    ragdollRef.current = ragdoll;
+    let env = createEnvironment3D(world, scene, setup);
+
+    // 5. Animation Loop
+    const animate = () => {
+      requestAnimationFrame(animate);
+      world.fixedStep();
+      ragdoll.update();
+      env.elements.forEach(e => {
+          if (e.update) e.update();
+          e.mesh.position.copy(e.body.position as any);
+          e.mesh.quaternion.copy(e.body.quaternion as any);
+      });
+      renderer.render(scene, camera);
+    };
+    animate();
+
+    const handleResize = () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    };
+    window.addEventListener('resize', handleResize);
+
+    return () => {
+      window.removeEventListener('mousedown', handleMouseDown);
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+      window.removeEventListener('resize', handleResize);
+      renderer.dispose();
+      containerRef.current?.removeChild(renderer.domElement);
+    };
+  }, [setup, triggerAIComment]);
 
   const getMoodColor = (mood: string) => {
     switch (mood) {
@@ -131,21 +173,17 @@ const App: React.FC = () => {
 
   return (
     <div className="relative w-full h-screen overflow-hidden bg-slate-950 font-sans">
-      {/* Background Gradient */}
-      <div className="absolute inset-0 bg-gradient-to-b from-slate-900 to-slate-950 opacity-50 pointer-events-none" />
-      
-      {/* Physics Canvas Container */}
-      <div ref={sceneRef} className="absolute inset-0" />
+      <div ref={containerRef} className="absolute inset-0" />
 
       {/* Narrative Box */}
       <div className="absolute top-6 left-1/2 -translate-x-1/2 w-full max-w-xl px-4 z-20 pointer-events-none">
-        <div className="bg-slate-900/80 backdrop-blur-md border border-slate-700 p-4 rounded-xl shadow-2xl flex items-start space-x-4 animate-in fade-in slide-in-from-top-4 duration-500 pointer-events-auto">
+        <div className="bg-slate-900/80 backdrop-blur-md border border-slate-700 p-4 rounded-xl shadow-2xl flex items-start space-x-4 pointer-events-auto">
           <div className={`w-12 h-12 rounded-full bg-slate-800 flex items-center justify-center shrink-0 border border-slate-600 ${isLoadingComment ? 'animate-pulse' : ''}`}>
-             <i className={`fas fa-microchip ${getMoodColor(comment.mood)} text-xl`}></i>
+             <i className={`fas fa-brain ${getMoodColor(comment.mood)} text-xl`}></i>
           </div>
           <div className="flex-1">
-            <h3 className="text-slate-400 text-xs font-bold uppercase tracking-wider mb-1">AI Narrator</h3>
-            <p className={`text-sm md:text-base font-medium ${getMoodColor(comment.mood)} italic`}>
+            <h3 className="text-slate-400 text-xs font-bold uppercase tracking-wider mb-1">Dimensional Observer</h3>
+            <p className={`text-sm md:text-base font-medium ${getMoodColor(comment.mood)} italic leading-relaxed`}>
               "{comment.text}"
             </p>
           </div>
@@ -158,48 +196,28 @@ const App: React.FC = () => {
           {Object.values(SetupType).map((type) => (
             <button
               key={type}
-              onClick={() => {
-                setSetup(type);
-                triggerAIComment(`The player switched to the ${type} experiment.`);
-              }}
+              onClick={() => setSetup(type)}
               className={`px-4 py-2 rounded-lg text-sm font-semibold transition-all duration-200 border ${
                 setup === type 
-                ? 'bg-indigo-600 border-indigo-400 text-white shadow-[0_0_15px_rgba(79,70,229,0.4)]' 
+                ? 'bg-indigo-600 border-indigo-400 text-white shadow-lg' 
                 : 'bg-slate-800 border-slate-600 text-slate-400 hover:bg-slate-700 hover:text-white'
               }`}
             >
               {type}
             </button>
           ))}
-          
-          <div className="h-8 w-px bg-slate-700 mx-2 hidden md:block" />
-          
-          <button
-            onClick={() => {
-                initPhysics();
-                triggerAIComment("The player reset the simulation after a horrific accident.");
-            }}
-            className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-lg text-sm font-semibold transition-all border border-rose-400 shadow-lg flex items-center gap-2"
-          >
-            <i className="fas fa-undo"></i> Reset
-          </button>
         </div>
       </div>
 
-      {/* Instructions */}
       <div className="absolute top-6 right-6 z-10 pointer-events-none hidden lg:block text-right">
         <div className="bg-slate-900/40 backdrop-blur-sm p-4 rounded-lg border border-slate-700/30">
-          <p className="text-slate-400 text-xs font-mono uppercase mb-2">Lab Controls</p>
+          <p className="text-slate-400 text-xs font-mono uppercase mb-2">3D Manipulation</p>
           <ul className="text-slate-300 text-sm space-y-1">
-            <li><span className="text-indigo-400 font-bold">DRAG</span> to move limbs</li>
-            <li><span className="text-indigo-400 font-bold">TOSS</span> to generate kinetic energy</li>
-            <li><span className="text-indigo-400 font-bold">SWITCH</span> to test durability</li>
+            <li><span className="text-indigo-400 font-bold">CLICK & DRAG</span> limb to toss</li>
+            <li><span className="text-indigo-400 font-bold">DEPTH</span> is handled automatically</li>
           </ul>
         </div>
       </div>
-
-      {/* Visual FX overlay */}
-      <div className="absolute inset-0 pointer-events-none border-[20px] border-indigo-500/5 mix-blend-overlay"></div>
     </div>
   );
 };
