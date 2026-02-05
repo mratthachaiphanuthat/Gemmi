@@ -1,0 +1,5 @@
+{
+  "name": "[Gem]Ragdoll Chaos: Kinetic Lab",
+  "description": "A high-fidelity physics playground where you can drag, toss, and torture a ragdoll through various experimental setups. Features real-time commentary from a witty AI narrator.",
+  "requestFramePermissions": []
+}
